@@ -80,23 +80,32 @@ func TestMap_ForceFill(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("get key %d", tt.elem.Key), func(t *testing.T) {
-			size := 256
+			size := 10_000
 			m := New(size)
 
 			// TODO: this is true for sparsehash, but not our swisstable,
 			// which sizes the underlying table slices to roundPow2(1/0.8) times the requested capacity.
 			// TODO: also, might no longer be true for sparestable, either.
 
-			// Force the underlying table to fill up the map so that it only has one empty slot left,
-			// without any resizing. This helps verify our triangular numbers are correct and
-			// we cycle properly.
-
 			// TODO: reach in to disable growth?
 			// We reach into the implementation to see what full means.
 			underlyingTableLen := len(m.table)
-			t.Logf("set %d elements in table with underlying size %d", underlyingTableLen-1, underlyingTableLen)
-			for i := 1000; i < 1000+underlyingTableLen-1; i++ {
-				m.Set(Key(i), Value(i))
+			t.Logf("setting %d elements in table with underlying size %d", underlyingTableLen-1, underlyingTableLen)
+
+			// Force the underlying table to fill up the map so that it only has one empty slot left,
+			// without any resizing. This helps verify our triangular numbers are correct and
+			// we cycle properly.  We also do this in a loop (so we set the same values repeatedly)
+			// in order to slightly stress things a bit more.
+			for i := 0; i < 100; i++ {
+				for j := 1000; j < 1000+underlyingTableLen-1; j++ {
+					m.Set(Key(j), Value(j))
+				}
+			}
+
+			// Confirm it is nearly 100% full, with only room for one more
+			gotLen := m.Len()
+			if gotLen != underlyingTableLen-1 {
+				t.Errorf("Map.Len gotLen = %v, want %v", gotLen, underlyingTableLen-1)
 			}
 
 			missingKey := Key(1e12)
@@ -120,7 +129,7 @@ func TestMap_ForceFill(t *testing.T) {
 			}
 
 			// Confirm it is 100% full according to the public API.
-			gotLen := m.Len()
+			gotLen = m.Len()
 			if gotLen != underlyingTableLen {
 				t.Errorf("Map.Len gotLen = %v, want %v", gotLen, underlyingTableLen)
 			}
@@ -673,6 +682,10 @@ func BenchmarkGet1K_Hit_Hot_16byte_Swisstable(b *testing.B) {
 					}
 				}
 			}
+			b.StopTimer()
+			// TODO: remove stats output
+			b.Logf("stats: gets: %d extra groups: %d tophash false pos: %d",
+				m.gets, m.getExtraGroups, m.getTopHashFalsePositives)
 		})
 	}
 }

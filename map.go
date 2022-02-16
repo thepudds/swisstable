@@ -122,6 +122,12 @@ type Map struct {
 	hashFunc  hashFunc
 	elemCount int
 	// resizeTable *sparsetable.Table
+
+	// TODO:
+	// stats
+	gets                     int64
+	getTopHashFalsePositives int64
+	getExtraGroups           int64
 }
 
 // capacity is a hint, and "at least"
@@ -147,6 +153,8 @@ func New(capacity int) *Map {
 }
 
 func (m *Map) Get(k Key) (v Value, ok bool) {
+	m.gets++ // stats
+
 	h := m.hashFunc(k)
 	group := h & m.groupMask
 	topHash := uint8((h >> 56) & 0xff)
@@ -164,8 +172,10 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 	// and (b) we always enforce at least some empty slots by resizing when needed.
 	for {
 		bitmask, ok := MatchByte(topHash, m.control[group*16:])
-		if !ok {
-			panic("short control byte slice")
+		if debug {
+			if !ok {
+				panic("short control byte slice")
+			}
 		}
 		if bitmask != 0 {
 			// We have at least one hit on topHash
@@ -178,6 +188,7 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 				if kv.Key == k {
 					return kv.Value, true
 				}
+				m.getTopHashFalsePositives++ // stats
 
 				// continue to look. infrequent with 7 bit topHash.
 				bitmask &= ^(1 << index)
@@ -193,8 +204,10 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 		// TODO: terminology: element, slot, bucket, group, ...
 		// probably: element, group, slot (with is empty or non-empty position within table)
 		emptyBitmask, ok := MatchByte(0, m.control[group*16:])
-		if !ok {
-			panic("short control byte slice")
+		if debug {
+			if !ok {
+				panic("short control byte slice")
+			}
 		}
 		emptyIndex := bits.TrailingZeros32(emptyBitmask)
 		if emptyIndex < 16 {
@@ -206,6 +219,7 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 		// We don't do quadratic probing within a group, but we do
 		// quadratic probing across groups.
 		// Continue our quadratic probing across groups, using triangular numbers.
+		m.getExtraGroups++ // stats
 		probeCount++
 		group = (group + probeCount) & m.groupMask
 		if debug {
@@ -241,7 +255,9 @@ func (m *Map) Set(k Key, v Value) {
 	for {
 		bitmask, ok := MatchByte(topHash, m.control[group*16:])
 		if !ok {
-			panic("short control byte slice")
+			if debug {
+				panic("short control byte slice")
+			}
 		}
 
 		if bitmask != 0 {
@@ -259,6 +275,7 @@ func (m *Map) Set(k Key, v Value) {
 					}
 					m.control[int(group*16)+index] = topHash
 					m.table[int(group*16)+index] = KV{Key: k, Value: v}
+					return
 				}
 				if debug {
 					fmt.Println("set: false collision on topHash: group:", group, "index:", index)
@@ -277,8 +294,10 @@ func (m *Map) Set(k Key, v Value) {
 		// Either way, find next empty slot and add our new value.
 		// TODO: for now, empty is 0
 		emptyBitmask, ok := MatchByte(0, m.control[group*16:])
-		if !ok {
-			panic("short control byte slice")
+		if debug {
+			if !ok {
+				panic("short control byte slice")
+			}
 		}
 		emptyIndex := bits.TrailingZeros32(emptyBitmask)
 		if emptyIndex < 16 {
@@ -307,8 +326,11 @@ func (m *Map) Set(k Key, v Value) {
 		// 	panic("impossible")
 		// }
 		// TODO: remove
-		if probeCount == uint64(len(m.table)/16) {
-			panic("impossible")
+		if debug {
+			if probeCount == uint64(len(m.table)/16) {
+				panic(fmt.Sprintf("impossible: probeCount: %d groups: %d underlying table len: %d",
+					probeCount, len(m.table)/16, len(m.table)))
+			}
 		}
 	}
 }
