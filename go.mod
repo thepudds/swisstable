@@ -1,4 +1,4 @@
-module temp
+module github.com/thepudds/swisstable-wip
 
 go 1.17
 

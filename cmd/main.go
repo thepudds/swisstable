@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"math/bits"
+
+	"github.com/thepudds/swisstable-wip"
 )
 
 func main() {
@@ -10,8 +12,12 @@ func main() {
 	buffer := []byte{42, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0}
 	// buffer := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	buffer = buffer[2:]
+	// buffer = buffer[2:8]
 	fmt.Println(len(buffer))
-	res := MatchByte(c, buffer)
+	res, ok := swisstable.MatchByte(c, buffer)
+	if !ok {
+		panic("not ok")
+	}
 	fmt.Println(res)
 	zeros := bits.TrailingZeros32(res)
 	if zeros == 32 {

@@ -8,6 +8,8 @@ import (
 	"github.com/mmcloughlin/avo/operand"
 )
 
+//go:generate go run . -out ../match_amd64.s -stubs ../match_stub.go -pkg swisstable
+
 // func main() {
 // 	TEXT("Set1", NOSPLIT, "func(c uint8) ")
 // 	x := Load(Param("c"), XMM())
@@ -43,7 +45,7 @@ import (
 // 	Generate()
 // }
 
-func main2() {
+func main() {
 	TEXT("MatchByte", NOSPLIT, "func(c uint8, buffer []byte) (mask uint32, ok bool)")
 	// TEXT("MatchByte", NOSPLIT, "func(c uint8, buffer *byte) uint32")
 	n := Load(Param("buffer").Len(), GP64())
