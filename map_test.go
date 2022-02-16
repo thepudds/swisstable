@@ -195,7 +195,7 @@ func BenchmarkNew_Int64_Std(b *testing.B) {
 }
 
 // TODO: make test driven, pick some values, match outpu from others
-func BenchmarkNew_Int64_Sparse(b *testing.B) {
+func BenchmarkNew_Int64_Swisstable(b *testing.B) {
 	bms := newBenchmarks
 	if !*longTestFlag {
 		bms = []benchmark{
@@ -288,7 +288,7 @@ func BenchmarkNewSweep_Int64_Std(b *testing.B) {
 	}
 }
 
-func BenchmarkNewSweep_Int64_Sparse(b *testing.B) {
+func BenchmarkNewSweep_Int64_Swisstable(b *testing.B) {
 	bms := sweepMapSizes()
 	if !*longTestFlag {
 		b.Skip()
@@ -497,7 +497,7 @@ func BenchmarkAdd1M_Int64_Std(b *testing.B) {
 	}
 }
 
-func BenchmarkAdd1M_Int64_Sparse(b *testing.B) {
+func BenchmarkAdd1M_Int64_Swisstable(b *testing.B) {
 	mapElements := 1_000_000
 
 	m := New(mapElements)
@@ -525,7 +525,7 @@ func BenchmarkAdd1K_Int64_Std(b *testing.B) {
 	}
 }
 
-func BenchmarkAdd1K_Int64_Sparse(b *testing.B) {
+func BenchmarkAdd1K_Int64_Swisstable(b *testing.B) {
 	mapElements := 1_000
 
 	m := New(mapElements)
@@ -558,7 +558,7 @@ func BenchmarkGet1K_Int64_1KStd(b *testing.B) {
 	}
 }
 
-func BenchmarkGet1K_Int64_1KSparse(b *testing.B) {
+func BenchmarkGet1K_Int64_1KSwisstable(b *testing.B) {
 	mapElements := 1_000
 
 	m := New(mapElements)
@@ -629,7 +629,7 @@ type benchmark struct {
 	mapElements int
 }
 
-func BenchmarkGet1K_Hit_Hot_16byte_Sparse(b *testing.B) {
+func BenchmarkGet1K_Hit_Hot_16byte_Swisstable(b *testing.B) {
 	const (
 		hotKeyCount = 20
 		lookupLoop  = 50

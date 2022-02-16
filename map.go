@@ -131,7 +131,9 @@ func New(capacity int) *Map {
 	// capacity, rounded up to a power of 2.
 	tableLength := calcTableLength(capacity)
 
-	fmt.Println("new: underlying table length", tableLength)
+	if debug {
+		fmt.Println("new: underlying table length", tableLength)
+	}
 	// TODO: not using capacity in our make calls. Probably right for straight swisstable impl?
 	control := make([]byte, tableLength)
 	table := make([]KV, tableLength)
@@ -169,7 +171,9 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 			// We have at least one hit on topHash
 			for {
 				index := bits.TrailingZeros32(bitmask)
-				fmt.Println("get: match on topHash:", index)
+				if debug {
+					fmt.Println("get: match on topHash:", index)
+				}
 				kv := m.table[int(group*16)+index]
 				if kv.Key == k {
 					return kv.Value, true
@@ -204,7 +208,9 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 		// Continue our quadratic probing across groups, using triangular numbers.
 		probeCount++
 		group = (group + probeCount) & m.groupMask
-		fmt.Println("get: CONTINUE to group:", group)
+		if debug {
+			fmt.Println("get: CONTINUE to group:", group)
+		}
 
 		// but need to update group logic
 
@@ -242,15 +248,21 @@ func (m *Map) Set(k Key, v Value) {
 			// We have at least one hit on topHash
 			for {
 				index := bits.TrailingZeros32(bitmask)
-				fmt.Println("set: match on topHash: group:", group, "index:", index)
+				if debug {
+					fmt.Println("set: match on topHash: group:", group, "index:", index)
+				}
 				kv := m.table[int(group*16)+index]
 				if kv.Key == k {
 					// update existing key
-					fmt.Println("set: updating existing key: group:", group, "index:", index)
+					if debug {
+						fmt.Println("set: updating existing key: group:", group, "index:", index)
+					}
 					m.control[int(group*16)+index] = topHash
 					m.table[int(group*16)+index] = KV{Key: k, Value: v}
 				}
-				fmt.Println("set: false collision on topHash: group:", group, "index:", index)
+				if debug {
+					fmt.Println("set: false collision on topHash: group:", group, "index:", index)
+				}
 
 				// continue to look. infrequent with 7 bit topHash.
 				bitmask &= ^(1 << index)
@@ -270,14 +282,18 @@ func (m *Map) Set(k Key, v Value) {
 		}
 		emptyIndex := bits.TrailingZeros32(emptyBitmask)
 		if emptyIndex < 16 {
-			fmt.Println("set: updating empty slot: group:", group, "index:", emptyIndex)
+			if debug {
+				fmt.Println("set: updating empty slot: group:", group, "index:", emptyIndex)
+			}
 			m.control[int(group*16)+emptyIndex] = topHash
 			m.table[int(group*16)+emptyIndex] = KV{Key: k, Value: v}
 			m.elemCount++
 			return
 		}
 		// TODO: keep probing. Also, resize makes this less common.
-		fmt.Println("set: FULL group:", group, "index:", emptyIndex)
+		if debug {
+			fmt.Println("set: FULL group:", group, "index:", emptyIndex)
+		}
 
 		// TODO: handle resize
 		// We don't do quadratic probing within a group, but we do
@@ -290,9 +306,10 @@ func (m *Map) Set(k Key, v Value) {
 		// if bucket != (firstBucket+triangleNum(probeCount))&m.bucketMask {
 		// 	panic("impossible")
 		// }
-		// if probeCount == uint64(m.table.Len()) {
-		// 	panic("impossible")
-		// }
+		// TODO: remove
+		if probeCount == uint64(len(m.table)/16) {
+			panic("impossible")
+		}
 	}
 }
 
@@ -372,3 +389,5 @@ func hashString(k string) uint64 {
 //go:linkname memhash runtime.memhash
 //go:noescape
 func memhash(p unsafe.Pointer, seed, s uintptr) uintptr
+
+const debug = false
