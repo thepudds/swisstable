@@ -43,6 +43,12 @@ import (
 // }
 
 func main() {
+	// TODO: add comment. Probably mention ok is only false if short.
+	// TODO: probably change signature to:
+	//  func(b []byte, c byte) (bitmask uint32, ok bool)
+	// similar to:
+	//    func IndexAny(s []byte, chars string) int
+	//    func IndexByte(b []byte, c byte) int
 	TEXT("MatchByte", NOSPLIT, "func(c uint8, buffer []byte) (mask uint32, ok bool)")
 	// TEXT("MatchByte", NOSPLIT, "func(c uint8, buffer *byte) uint32")
 	Comment("Get our input parameters")
@@ -69,16 +75,12 @@ func main() {
 	Label("valid")
 	Comment("Input slice is a valid length")
 
-	// ptr := Load(Param("buffer"), GP64())
 	Comment("Move c into an xmm register")
 	x0, x1, x2 := XMM(), XMM(), XMM()
 	MOVD(c, x0)
 	Comment("Shuffle the value of c into every byte of another xmm register")
 	PXOR(x1, x1)
 	PSHUFB(x1, x0)
-	// if !operand.IsM128(operand.Mem{Base: ptr}) {
-	// 	panic("not m128")
-	// }
 	// Mem example from https://github.com/mmcloughlin/avo/blob/master/examples/fnv1a/asm.go#L32
 	// also: https://github.com/mmcloughlin/avo/blob/master/examples/sum/asm.go
 	// https://c9x.me/x86/html/file_module_x86_id_184.html
