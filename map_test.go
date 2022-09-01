@@ -3,10 +3,12 @@ package swisstable
 import (
 	"flag"
 	"fmt"
+	"math"
 	"math/bits"
 	"math/rand"
 	"runtime"
 	"testing"
+	"time"
 )
 
 var longTestFlag = flag.Bool("long", false, "run long benchmarks")
@@ -172,6 +174,15 @@ var newBenchmarks = []benchmark{
 	{"map size 80000000", 80_000_000},
 	{"map size 90000000", 90_000_000},
 	{"map size 100000000", 100_000_000},
+}
+
+func BenchmarkMatchByte(b *testing.B) {
+	buffer := make([]byte, 16)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = MatchByte(42, buffer)
+	}
+
 }
 
 func BenchmarkNew_Int64_Std(b *testing.B) {
@@ -686,6 +697,90 @@ func BenchmarkGet1K_Hit_Hot_16byte_Swisstable(b *testing.B) {
 			// TODO: remove stats output
 			b.Logf("stats: gets: %d extra groups: %d tophash false pos: %d",
 				m.gets, m.getExtraGroups, m.getTopHashFalsePositives)
+		})
+	}
+}
+
+func BenchmarkGet1K_Hit_Cold_Swisstable(b *testing.B) {
+	var bms []benchmark
+	if !*longTestFlag {
+		bms = []benchmark{
+			{"map size 1000", 1_000},
+			{"map size 10000", 10_000},
+			{"map size 100000", 100_000},
+			{"map size 1000000", 1_000_000},
+		}
+	} else {
+		bms = coarseMapSizes()
+		bms = append(bms, fineMapSizes()...)
+	}
+
+	for _, bm := range bms {
+		b.Run(bm.name, func(b *testing.B) {
+			minMem := 512.0 * (1 << 20)
+
+			// we don't use overhead to keep the count of maps consistent
+			// across different implemenations
+			mapMem := float64(bm.mapElements) * 16
+			mapCnt := int(math.Ceil(minMem / mapMem))
+
+			keys := make([]Key, bm.mapElements)
+			for i := 0; i < len(keys); i++ {
+				keys[i] = Key(i)
+			}
+			rand.Shuffle(len(keys), func(i, j int) {
+				keys[i], keys[j] = keys[j], keys[i]
+			})
+
+			b.Logf("creating %d maps with %.1f KB of data. %d total keys", mapCnt, float64(mapCnt)*mapMem/1024, mapCnt*bm.mapElements)
+			maps := make([]*Map, mapCnt)
+			for i := 0; i < mapCnt; i++ {
+				m := New(bm.mapElements)
+				for j := 0; j < bm.mapElements; j++ {
+					m.Set(Key(j), Value(j))
+				}
+				maps[i] = m
+			}
+			rand.Shuffle(len(maps), func(i, j int) {
+				maps[i], maps[j] = maps[j], maps[i]
+			})
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			start := time.Now()
+			for i := 0; i < b.N; i++ {
+				// Exhaustively look up all keys
+				for _, k := range keys {
+					for _, m := range maps {
+						// force no op:
+						// _ = k
+						// _ = m
+
+						// force key reuse:
+						// k = 0
+
+						// do real work
+						v, b := m.Get(Key(k))
+						sinkUint = uint64(v)
+						sinkBool = b
+					}
+				}
+				// Done with this i for b.N.
+				// Get new keys, and shuffle our maps.
+				// TODO: Could sufficient to just pick random starting position for the maps,
+				// but shuffle might be fast enough - shuffle 1M takes ~35ms.
+				// b.StopTimer()
+				// // TODO: no keys
+				// // keys = randomKeys(coldKeyCount, bm.mapElements-coldKeyCount)
+				// // TODO: maybe not needed to shuffle maps again?
+				// rand.Shuffle(len(maps), func(i, j int) {
+				// 	maps[i], maps[j] = maps[j], maps[i]
+				// })
+				// b.StartTimer()
+				end := time.Since(start)
+				b.ReportMetric(float64(end.Nanoseconds())/(float64(b.N)*float64(len(keys)*len(maps))), "ns/get")
+			}
 		})
 	}
 }

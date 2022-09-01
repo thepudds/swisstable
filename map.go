@@ -162,6 +162,8 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 	if topHash == 0 {
 		topHash++
 	}
+	controlLenMask := len(m.control) - 1
+	tableLenMask := len(m.table) - 1
 
 	// firstBucket := bucket
 	var probeCount uint64
@@ -171,7 +173,7 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 	// triangluar numbers will hit every slot in a power of 2 sized table
 	// and (b) we always enforce at least some empty slots by resizing when needed.
 	for {
-		bitmask, ok := MatchByte(topHash, m.control[group*16:])
+		bitmask, ok := MatchByte(topHash, m.control[(group*16)&uint64(controlLenMask):])
 		if debug {
 			if !ok {
 				panic("short control byte slice")
@@ -184,7 +186,7 @@ func (m *Map) Get(k Key) (v Value, ok bool) {
 				if debug {
 					fmt.Println("get: match on topHash:", index)
 				}
-				kv := m.table[int(group*16)+index]
+				kv := m.table[(int(group*16)+index)&tableLenMask]
 				if kv.Key == k {
 					return kv.Value, true
 				}

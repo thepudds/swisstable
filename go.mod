@@ -4,7 +4,6 @@ go 1.17
 
 require (
 	github.com/mmcloughlin/avo v0.4.0
-	github.com/thpudds/sparsehash v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -14,4 +13,3 @@ require (
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 )
 
-replace github.com/thpudds/sparsehash => ../sparsehash-wip
