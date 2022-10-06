@@ -6,67 +6,577 @@ import (
 	"math"
 	"math/bits"
 	"math/rand"
-	"runtime"
+	"sort"
 	"testing"
-	"time"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 var longTestFlag = flag.Bool("long", false, "run long benchmarks")
+var coldMemTestFlag = flag.Float64("coldmem", 512, "memory in MB to use for cold memory tests. should be substantially larger than L3 cache.")
 
-func TestMap_Set(t *testing.T) {
+// TODO: 1000 is probably reasonable
+var repFlag = flag.Int("rep", 200, "number of repetitions for some tests that are randomized")
+
+func TestMap_Get(t *testing.T) {
 	tests := []struct {
-		elem KV
+		name string
+		keys []Key
 	}{
-		{KV{Key: 1, Value: 2}},
-		{KV{Key: 3, Value: 4}},
-		{KV{Key: 8, Value: 1e9}},
-		{KV{Key: 1e6, Value: 1e10}},
+		{"one key", []Key{1}},
+		{"small, with one grow", list(0, 20, 1)},
+		{"small, with multiple grows", list(0, 111, 1)}, // from fuzzing
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("set key %d", tt.elem.Key), func(t *testing.T) {
-			m := New(256)
+		t.Run(fmt.Sprintf(tt.name), func(t *testing.T) {
+			m := New(10)
+			m.hashFunc = identityHash
 
-			m.Set(tt.elem.Key, tt.elem.Value)
+			for _, k := range tt.keys {
+				m.Set(Key(k), Value(k))
+			}
 
 			gotLen := m.Len()
-			if gotLen != 1 {
-				t.Errorf("Map.Len() == %d, want 1", gotLen)
+			if gotLen != len(tt.keys) {
+				t.Errorf("Map.Len() = %d, want %d", gotLen, len(tt.keys))
+			}
+
+			for _, k := range tt.keys {
+				gotV, gotOk := m.Get(k)
+				if gotV != Value(k) || !gotOk {
+					t.Errorf("Map.Get(%v) = %v, %v. want = %v, true", k, gotV, gotOk, k)
+				}
+			}
+
+			notPresent := Key(1e12)
+			gotV, gotOk := m.Get(notPresent)
+			if gotV != 0 || gotOk {
+				t.Errorf("Map.Get(notPresent) = %v, %v. want = 0, false", gotV, gotOk)
 			}
 		})
 	}
 }
 
-func TestMap_Get(t *testing.T) {
+func TestMap_Range(t *testing.T) {
 	tests := []struct {
-		elem KV
+		name  string
+		elems map[Key]Value
 	}{
-		{KV{Key: 1, Value: 2}},
-		{KV{Key: 8, Value: 8}},
-		{KV{Key: 1e6, Value: 1e10}},
+		{
+			"three elements",
+			map[Key]Value{
+				1:   2,
+				8:   8,
+				1e6: 1e10,
+			},
+		},
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("get key %d", tt.elem.Key), func(t *testing.T) {
-			m := New(256)
+		t.Run(tt.name, func(t *testing.T) {
+			m := New(256) // TODO: confirm this is probably 512 underlying table length?
 
-			m.Set(tt.elem.Key, tt.elem.Value)
-			gotV, gotOk := m.Get(tt.elem.Key)
-			if !gotOk {
-				t.Errorf("Map.Get() gotOk = %v, want true", gotOk)
+			for key, value := range tt.elems {
+				m.Set(key, value)
+				gotV, gotOk := m.Get(key)
+				if !gotOk {
+					t.Errorf("Map.Get() gotOk = %v, want true", gotOk)
+				}
+				if gotV != value {
+					t.Errorf("Map.Get() gotV = %v, want %v", gotV, value)
+				}
 			}
-			if gotV != tt.elem.Value {
-				t.Errorf("Map.Get() gotV = %v, want %v", gotV, tt.elem.Value)
+			got := make(map[Key]Value)
+			m.Range(func(key Key, value Value) bool {
+				// validate we don't see the same key twice
+				_, ok := got[key]
+				if ok {
+					dumpFixedTables(m)
+					t.Errorf("Map.Range() key %v seen before", key)
+				}
+				got[key] = value
+				return true
+			})
+			// validate our returned key/values match what we put in
+			if diff := cmp.Diff(tt.elems, got); diff != "" {
+				t.Errorf("Map.Range() result mismatch (-want +got):\n%s", diff)
+			}
+			gotLen := m.Len()
+			if gotLen != len(tt.elems) {
+				t.Errorf("Map.Len() gotV = %v, want %v", gotLen, len(tt.elems))
+			}
+		})
+	}
+}
+
+func TestMap_Delete(t *testing.T) {
+	tests := []struct {
+		name            string
+		capacity        int
+		disableResizing bool
+		insert          int
+		deleteFront     int
+		deleteBack      int
+	}{
+		{
+			name:            "small, delete one",
+			disableResizing: false,
+			capacity:        256,
+			insert:          2,
+			deleteFront:     1,
+			deleteBack:      0,
+		},
+		{
+			name:            "small, delete one after resizing",
+			disableResizing: false,
+			capacity:        10,
+			insert:          20, // this forces a resize
+			deleteFront:     0,
+			deleteBack:      0,
+		},
+		{
+			name:            "delete ten after resizing",
+			disableResizing: false,
+			capacity:        256,
+			insert:          510, // this forces a resize
+			deleteFront:     0,
+			deleteBack:      10,
+		},
+		{
+			name:            "delete ten force fill",
+			disableResizing: true,
+			capacity:        256,
+			insert:          510, // this is close to full
+			deleteFront:     0,
+			deleteBack:      10,
+		},
+		{
+			name:            "delete all after resizing",
+			disableResizing: false,
+			capacity:        256,
+			insert:          511, // this forces a resize
+			deleteFront:     256,
+			deleteBack:      256,
+		},
+		{
+			name:            "delete all force fill",
+			disableResizing: true,
+			capacity:        256,
+			insert:          511, // this is a force fill, leaving one empty slot
+			deleteFront:     256,
+			deleteBack:      256,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New(tt.capacity)
+			want := make(map[Key]Value)
+
+			for i := 0; i < tt.insert; i++ {
+				m.Set(Key(i), Value(i))
+				want[Key(i)] = Value(i)
 			}
 
-			gotV, gotOk = m.Get(1e12)
-			if gotOk {
-				t.Errorf("Map.Get() gotOk = %v, want false", gotOk)
+			// // Delete a non-existent key
+			m.Delete(-1)
+			delete(want, -1)
+
+			// Delete requested keys
+			for i := 0; i < tt.deleteFront; i++ {
+				m.Delete(Key(i))
+				delete(want, Key(i))
 			}
-			if gotV != 0 {
-				t.Errorf("Map.Get() gotV = %v, want %v", gotV, 0)
+			for i := tt.insert - tt.deleteBack; i < tt.insert; i++ {
+				m.Delete(Key(i))
+				delete(want, Key(i))
 			}
 
+			got := make(map[Key]Value)
+			m.Range(func(key Key, value Value) bool {
+				// validate we don't see the same key twice
+				_, ok := got[key]
+				if ok {
+					t.Errorf("Map.Range() key %v seen twice", key)
+				}
+				got[key] = value
+				return true
+			})
+
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Logf("slots: %v", m.current.slots)
+				t.Errorf("Map.Range() result mismatch (-want +got):\n%s", diff)
+			}
+			gotLen := m.Len()
+			if gotLen != len(want) {
+				t.Errorf("Map.Len() gotV = %v, want %v", gotLen, len(want))
+			}
+		})
+	}
+}
+
+// TODO: force example of an *allowed* repeat key from a range, such as:
+//    https://go.dev/play/p/y8kvkPoNCv_H
+// We can't quite create that same pattern with the current TestMap_RangeAddDelete,
+// including the bulk add doesn't happen after all the preceding add/deletes.
+
+func TestMap_RangeAddDelete(t *testing.T) {
+	tests := []struct {
+		name          string
+		repeatAllowed bool // allow repeated key, such as if add X, del X, then add X while iterating
+		capacity      int
+		start         []Key
+		del           []Key
+		add           []Key
+		addBulk       []Key // can be set up to trigger resize in middle of loop if desired
+		addBulk2      []Key
+		bulkIndex     int // loop index in Map range to do the addBulk
+	}{
+		{
+			name:          "small",
+			repeatAllowed: true, // this pattern could in theory trigger repeat key
+			capacity:      16,
+			start:         []Key{1, 2, 3, 4},
+			del:           []Key{3, 4},
+			add:           []Key{5, 6, 4, 7},
+			addBulk:       nil,
+			addBulk2:      nil,
+			bulkIndex:     0,
+		},
+		{
+			name:          "small with one grow",
+			repeatAllowed: false,
+			capacity:      8, // will be table len of 16
+			start:         []Key{1, 2, 3, 4},
+			del:           nil,
+			add:           nil,
+			addBulk:       list(5, 15, 1),
+			addBulk2:      nil,
+			bulkIndex:     0,
+		},
+		{
+			name:          "small with two grows",
+			repeatAllowed: false,
+			capacity:      8, // will be table len of 16
+			start:         []Key{1, 2, 3, 4},
+			del:           nil,
+			add:           nil,
+			addBulk:       list(5, 30, 1),
+			addBulk2:      nil,
+			bulkIndex:     0,
+		},
+		{
+			name:          "small, start iter mid-grow then grow",
+			repeatAllowed: false,
+			capacity:      8, // will be table len of 16
+			start:         list(0, 53, 1),
+			del:           nil,
+			add:           nil,
+			addBulk:       list(64, 128, 1),
+			addBulk2:      nil,
+			bulkIndex:     0,
+		},
+		{
+			name:          "medium",
+			repeatAllowed: true, // this pattern could in theory trigger repeat key
+			capacity:      650,
+			start:         list(0, 500, 1),
+			del:           list(10, 400, 1),
+			add:           list(500, 650, 1),
+			addBulk:       list(10, 400, 1),
+			addBulk2:      []Key{},
+			bulkIndex:     400,
+		},
+		{
+			name:          "medium, start iter mid-grow then grow",
+			repeatAllowed: false,
+			capacity:      8,               // will be table len of 16
+			start:         list(0, 417, 1), // trigger growth at 416
+			del:           nil,
+			add:           list(512, 950, 1),
+			addBulk:       nil,
+			addBulk2:      nil,
+			bulkIndex:     415,
+		},
+		{
+			name:          "medium, start iter mid-grow, overlapping writes during iter", // from fuzzing
+			repeatAllowed: false,
+			capacity:      48,
+			start:         list(48, 102, 1), // 54 elems, grow starts at 52
+			del:           nil,
+			add:           nil,
+			addBulk:       list(11, 119, 1), // 108 elems, some overlapping
+			addBulk2:      nil,
+			bulkIndex:     0,
+		},
+		{
+			name:          "medium, two bulks adds",
+			repeatAllowed: true, // this pattern could in theory trigger repeat key
+			capacity:      650,
+			start:         list(0, 300, 1),
+			del:           list(0, 299, 1),
+			add:           nil,
+			addBulk:       list(1000, 1300, 1),
+			addBulk2:      list(0, 300, 1),
+			bulkIndex:     256 + 8,
+		},
+		{
+			name:          "medium, no del",
+			repeatAllowed: false,
+			capacity:      650,
+			start:         list(0, 500, 1),
+			del:           nil,
+			add:           list(500, 650, 1),
+			addBulk:       list(10, 400, 1),
+			addBulk2:      nil,
+			bulkIndex:     400,
+		},
+		{
+			name:          "medium, no add overlaps del",
+			repeatAllowed: false,
+			capacity:      650,
+			start:         list(0, 500, 1),
+			del:           list(10, 400, 1), // no add overlaps with what we delete
+			add:           list(500, 650, 1),
+			addBulk:       list(500, 800, 1),
+			addBulk2:      nil,
+			bulkIndex:     400,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		for _, startCap := range []int{tt.capacity, 10, 20, 40, 52, 53, 54, 100, 1000} {
+			t.Run(fmt.Sprintf("%s, start cap %d", tt.name, startCap), func(t *testing.T) {
+				t.Parallel()
+				for rep := 0; rep < *repFlag; rep++ {
+					// Create the Map under test.
+					m := New(startCap)
+					m.seed = uintptr(rep)
+					// TODO:
+					// m.hashFunc = identityHash
+					// m.hashFunc = zeroHash
+					// // TODO: TEMP. get into subtest name
+					switch rep {
+					case 0:
+						m.hashFunc = identityHash
+					case 1:
+						// do this second (worse perf, even further from reality than identityHash)
+						m.hashFunc = zeroHash
+					default:
+						m.hashFunc = hashUint64 // real hash
+					}
+
+					for _, key := range tt.start {
+						m.Set(key, Value(key))
+					}
+
+					// Create some sets to dynamically track validity of keys that appear in a range
+					allowed := newKeySet(tt.start) // tracks start + added - deleted; these keys allowed but not required
+					mustSee := newKeySet(tt.start) // tracks start - deleted; these are keys we are required to see at some point
+					seen := newKeySet(nil)         // use to verify no dups, and at end, used to verify mustSee
+					// Also dynamically track if key X is added, deleted, and then re-added during iteration,
+					// which means it is legal per Go spec to be seen again in the iteration.
+					// Example with stdlib map repeating keys during iter: https://go.dev/play/p/RN-v8rmQmeE
+					deleted := newKeySet(nil)
+					addedAfterDeleted := newKeySet(nil)
+
+					// during loop, verify no duplicate keys and we only see allowed keys.
+					// after loop, verify that we saw everything that we were required to see.
+					i := 0
+					m.Range(func(key Key, value Value) bool {
+						if seen.contains(key) {
+							if !tt.repeatAllowed {
+								t.Fatalf("Map.Range() key %v seen twice, unexpected for this test", key)
+							}
+							// Even though this pattern is generally allowed to have repeats,
+							// verify this specific key has been added, then deleted, then added,
+							// which means it is legal to see it later in the iteration after
+							// being re-added.
+							if !addedAfterDeleted.contains(key) {
+								t.Fatalf("Map.Range() key %v seen twice and was not re-added after being deleted", key)
+							}
+						}
+						seen.add(key)
+
+						if !allowed.contains(key) {
+							t.Fatalf("Map.Range() key %v seen but not allowed (e.g., might have been deleted, or never added)", key)
+						}
+
+						// Delete one key, if requested
+						if i < len(tt.del) {
+							k := tt.del[i]
+							m.Delete(k)
+							allowed.remove(k)
+							mustSee.remove(k) // We are no longer required to see this... It's ok if we saw it earlier
+							deleted.add(k)
+							if addedAfterDeleted.contains(k) {
+								addedAfterDeleted.remove(k)
+							}
+						}
+
+						set := func(k Key, v Value) {
+							m.Set(k, v) // TODO: not checking values. maybe different test?
+							allowed.add(k)
+							if deleted.contains(k) {
+								addedAfterDeleted.add(k)
+								deleted.remove(k)
+							}
+						}
+						// Add one key, if requested
+						if i < len(tt.add) {
+							set(tt.add[i], Value(i+1e6))
+						}
+						// Bulk add keys, if requested
+						if i == tt.bulkIndex {
+							for _, k := range tt.addBulk {
+								set(k, Value(i+1e9))
+							}
+							for _, k := range tt.addBulk2 {
+								set(k, Value(i+1e12))
+							}
+						}
+						i++
+						return true
+					})
+
+					for _, key := range mustSee.elems() {
+						if !seen.contains(key) {
+							dumpFixedTables(m)
+							t.Fatalf("Map.Range() expected key %v not seen. table size: %d grows: %d",
+								key, m.elemCount, m.resizeGenerations)
+						}
+					}
+
+					if !tt.repeatAllowed && addedAfterDeleted.len() > 0 {
+						// TODO: is this still working? Verfied once
+						// repeatAllowed could be inferred in theory,
+						// but keep it as extra sanity check and to be more explicit on expectations
+						t.Fatal("repeatAllowed incorrectly set to false")
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestMap_IterGrowAndDelete is modeled after TestIterGrowAndDelete
+// from runtime/map_test.go.
+func TestMap_IterGrowAndDelete(t *testing.T) {
+	m := New(16) // will resize
+	for i := 0; i < 100; i++ {
+		m.Set(Key(i), Value(i))
+	}
+	growflag := true
+	m.Range(func(key Key, value Value) bool {
+		if growflag {
+			// grow the table
+			for i := 100; i < 1000; i++ {
+				m.Set(Key(i), Value(i))
+			}
+			// delete all odd keys
+			for i := 1; i < 1000; i += 2 {
+				m.Delete(Key(i))
+			}
+			growflag = false
+		} else {
+			if key&1 == 1 {
+				t.Errorf("odd value returned %d", key)
+			}
+		}
+		return true
+	})
+}
+
+func TestMap_StoredKeys(t *testing.T) {
+	// TODO: probably make helper?
+	list := func(start, end Key) []Key {
+		var res []Key
+		for i := start; i < end; i++ {
+			res = append(res, i)
+		}
+		return res
+	}
+
+	storedKeys := func(m *Map) []Key {
+		// reach into the implementation to return
+		// keys in stored order
+		if m.old != nil {
+			panic("unexpectedly growing")
+		}
+		var keys []Key
+		for i := range m.current.control {
+			if isStored(m.current.control[i]) {
+				keys = append(keys, m.current.slots[i].Key)
+			}
+		}
+		return keys
+	}
+
+	tests := []struct {
+		name     string
+		capacity int
+		start    []Key
+		del      []Key
+		add      []Key
+		want     []Key
+	}{
+		{
+			name:     "delete key, add different key, 1 group",
+			capacity: 8, // ends up with 16 slots
+			start:    []Key{0, 1, 2, 3},
+			del:      []Key{2},
+			add:      []Key{42}, // the slot that had 2 is replaced with 42
+			want:     []Key{0, 1, 42, 3},
+		},
+		{
+			name:     "delete key 1st group, add different key, 2 groups",
+			capacity: 16,          // ends up with 32 slots
+			start:    list(0, 20), // [0, 20)
+			del:      []Key{2},
+			add:      []Key{42}, // the DELETED slot that had 2 is replaced with 42
+			want:     append([]Key{0, 1, 42}, list(3, 20)...),
+		},
+		{
+			name:     "delete key 1st group, set key present in 2nd group",
+			capacity: 16,          // ends up with 32 slots
+			start:    list(0, 20), // [0, 20)
+			del:      []Key{2},
+			add:      []Key{19}, // should end up with single 19, still in the second group
+			want:     append([]Key{0, 1}, list(3, 20)...),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create the Map under test.
+			m := New(tt.capacity)
+
+			// Reach into the implementation to force a terrible hash func,
+			// which lets us more predictably place elems.
+			hashToZero := func(k Key, seed uintptr) uint64 {
+				// could do something like: return uint64(k << m.current.h2Shift)
+				return 0
+			}
+			m.hashFunc = hashToZero
+
+			// Apply our operations
+			for _, key := range tt.start {
+				m.Set(key, Value(key))
+			}
+			for _, key := range tt.del {
+				m.Delete(key)
+			}
+			for _, key := range tt.add {
+				m.Set(key, Value(key))
+			}
+
+			got := storedKeys(m)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Logf("got: %v", got)
+				t.Errorf("stored keys mismatch (-want +got):\n%s", diff)
+			}
 		})
 	}
 }
@@ -84,6 +594,7 @@ func TestMap_ForceFill(t *testing.T) {
 		t.Run(fmt.Sprintf("get key %d", tt.elem.Key), func(t *testing.T) {
 			size := 10_000
 			m := New(size)
+			m.disableResizing = true
 
 			// TODO: this is true for sparsehash, but not our swisstable,
 			// which sizes the underlying table slices to roundPow2(1/0.8) times the requested capacity.
@@ -91,7 +602,7 @@ func TestMap_ForceFill(t *testing.T) {
 
 			// TODO: reach in to disable growth?
 			// We reach into the implementation to see what full means.
-			underlyingTableLen := len(m.table)
+			underlyingTableLen := len(m.current.slots)
 			t.Logf("setting %d elements in table with underlying size %d", underlyingTableLen-1, underlyingTableLen)
 
 			// Force the underlying table to fill up the map so that it only has one empty slot left,
@@ -136,44 +647,61 @@ func TestMap_ForceFill(t *testing.T) {
 				t.Errorf("Map.Len gotLen = %v, want %v", gotLen, underlyingTableLen)
 			}
 			// Reach in to the impl and to confirm that it is indeed seem to be 100% full
-			for i := 0; i < len(m.control); i++ {
-				// TODO: 0 currently means empty
-				if m.control[i] == 0 {
+			for i := 0; i < len(m.current.control); i++ {
+				if m.current.control[i] == emptySentinel {
 					t.Fatalf("control byte %d is empty", i)
 				}
 			}
-			for i := 0; i < len(m.table); i++ {
-				if m.table[i].Key == 0 || m.table[i].Value == 0 {
+			for i := 0; i < len(m.current.slots); i++ {
+				if m.current.slots[i].Key == 0 || m.current.slots[i].Value == 0 {
 					// We set everything to non-zero values above.
 					t.Fatalf("element at index %d has key or value that is still 0: key = %d value = %d",
-						i, m.table[i].Key, m.table[i].Value)
+						i, m.current.slots[i].Key, m.current.slots[i].Value)
 				}
 			}
-
 		})
 	}
 }
 
-var newBenchmarks = []benchmark{
-	{"map size 1000000", 1_000_000},
-	{"map size 2000000", 2_000_000},
-	{"map size 3000000", 3_000_000},
-	{"map size 4000000", 4_000_000},
-	{"map size 5000000", 5_000_000},
-	{"map size 6000000", 6_000_000},
-	{"map size 7000000", 7_000_000},
-	{"map size 8000000", 8_000_000},
-	{"map size 9000000", 9_000_000},
-	{"map size 10000000", 10_000_000},
-	{"map size 20000000", 20_000_000},
-	{"map size 30000000", 30_000_000},
-	{"map size 40000000", 40_000_000},
-	{"map size 50000000", 50_000_000},
-	{"map size 60000000", 60_000_000},
-	{"map size 70000000", 70_000_000},
-	{"map size 80000000", 80_000_000},
-	{"map size 90000000", 90_000_000},
-	{"map size 100000000", 100_000_000},
+func Test_StatusByte(t *testing.T) {
+	// probably/hopefully overkill
+	b := byte(0)
+	if isEvacuated(b) || isChainEvacuated(b) || curHasDisplaced(b) {
+		t.Errorf("statusByte unexpectedly set")
+	}
+
+	got := setEvacuated(b)
+	if !isEvacuated(got) {
+		t.Errorf("isEvacuated() = false, got = %v", got)
+	}
+	if isChainEvacuated(got) {
+		t.Errorf("isChainEvacuated() = true")
+	}
+	if curHasDisplaced(got) {
+		t.Errorf("curHasDisplaced() = true")
+	}
+
+	got = setChainEvacuated(b)
+	if isEvacuated(got) {
+		t.Errorf("isEvacuated() = true")
+	}
+	if !isChainEvacuated(got) {
+		t.Errorf("isChainEvacuated() = false, got = %v", got)
+	}
+	if curHasDisplaced(got) {
+		t.Errorf("curHasDisplaced() = true")
+	}
+
+	got = setCurHasDisplaced(b)
+	if isEvacuated(got) {
+		t.Errorf("isEvacuated() = true")
+	}
+	if isChainEvacuated(got) {
+		t.Errorf("isChainEvacuated() = true")
+	}
+	if !curHasDisplaced(got) {
+		t.Errorf("curHasDisplaced() = false, got = %v", got)
+	}
 }
 
 func BenchmarkMatchByte(b *testing.B) {
@@ -182,41 +710,14 @@ func BenchmarkMatchByte(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = MatchByte(42, buffer)
 	}
-
 }
 
-func BenchmarkNew_Int64_Std(b *testing.B) {
-	bms := newBenchmarks
-	if !*longTestFlag {
-		bms = []benchmark{
-			{"map size 1000000", 1_000_000},
-		}
-	}
-
-	for _, bm := range bms {
-		b.Run(bm.name, func(b *testing.B) {
-			b.ReportAllocs()
-			b.ResetTimer()
-
-			for i := 0; i < b.N; i++ {
-				testA = make(map[int64]*int64, bm.mapElements)
-			}
-			b.StopTimer()
-			runtime.GC()
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
-			b.ReportMetric(float64(memStats.HeapAlloc)/float64(16*bm.mapElements), "overhead")
-			b.ReportMetric(float64(memStats.HeapAlloc), "heap:bytes")
-
-			// the nil reduces highwater mark -- don't have 2 in mem at once
-			testA = nil
-		})
-	}
-}
-
-// TODO: make test driven, pick some values, match outpu from others
-func BenchmarkNew_Int64_Swisstable(b *testing.B) {
-	bms := newBenchmarks
+func BenchmarkFillGrow_Swiss(b *testing.B) {
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
 	if !*longTestFlag {
 		bms = []benchmark{
 			{"map size 1000000", 1_000_000},
@@ -225,502 +726,395 @@ func BenchmarkNew_Int64_Swisstable(b *testing.B) {
 	for _, bm := range bms {
 		b.Run(bm.name, func(b *testing.B) {
 			b.ReportAllocs()
-			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				testB = New(bm.mapElements)
+				m := New(10)
+				for j := Key(0); j < Key(bm.mapElements); j++ {
+					m.Set(j, Value(j))
+				}
 			}
-			b.StopTimer()
-			runtime.GC()
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
-			b.ReportMetric(float64(memStats.HeapAlloc)/float64(16*bm.mapElements), "overhead")
-			b.ReportMetric(float64(memStats.HeapAlloc), "heap:bytes")
-
-			// the nil reduces highwater mark -- don't have 2 in mem at once
-			testB = nil
-
-			// currently:
-			// 201458656/(1024*1024)=192
-			// 11534336*17.5=201458656
-			// 1.5 extra per slot is 96 extra per 64 (64*1.5)
-			// We are half capacity... so len is 2x capacity, so that's 1 byte accounted for...
-			// with mystery of 0.5 per 128 slots (I think) or 0.25 per __ ... or rethink!
-			// for this test, B/op is shows same as live heap because all the allocation happens in the loop.
-			// for start empty and add 1M, they hopefully show a difference.
-			/* could instead use:
-			https://pkg.go.dev/runtime/metrics
-
-			/memory/classes/heap/objects:bytes
-			Memory occupied by live objects and dead objects that have
-			not yet been marked free by the garbage collector.
-			*/
-
-			/* If we request a capacity of 10M elements of 16 byte total payload (keys + values = 16 bytes),
-			that currently works out to:
-
-			no overhead bytes:  160000000 (152.6 MB)
-
-			requested cap:       10000000
-			actual cap:          10485760
-			table size:          16777216 (16.000 M)
-			load factor:           62.50%
-			groups:                262144
-
-			data bytes:         167772160 (95.24%)
-			group bytes:          8388608 (4.76%)
-			total bytes:        176160768 (100.00%) (168.0 MB)
-
-			capacity overhead:      1.05x
-			group overhead:         1.05x
-			total overhead:         1.10x
-			*/
 		})
 	}
 }
 
-func BenchmarkNewSweep_Int64_Std(b *testing.B) {
-	bms := sweepMapSizes()
-
+func BenchmarkFillGrow_Std(b *testing.B) {
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
 	if !*longTestFlag {
-		b.Skip()
+		bms = []benchmark{
+			{"map size 1000000", 1_000_000},
+		}
 	}
-
 	for _, bm := range bms {
 		b.Run(bm.name, func(b *testing.B) {
 			b.ReportAllocs()
-			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				testA = make(map[int64]*int64, bm.mapElements)
+				m := make(map[int64]int64, 10)
+				for j := int64(0); j < int64(bm.mapElements); j++ {
+					m[j] = j
+				}
 			}
-
-			b.StopTimer()
-			runtime.GC()
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
-			b.ReportMetric(float64(memStats.HeapAlloc)/float64(16*bm.mapElements), "overhead")
-			b.ReportMetric(float64(memStats.HeapAlloc), "heap:bytes")
-
-			// the nil reduces highwater mark -- don't have 2 in mem at once
-			testA = nil
 		})
 	}
 }
 
-func BenchmarkNewSweep_Int64_Swisstable(b *testing.B) {
-	bms := sweepMapSizes()
+func BenchmarkFillPresize_Swiss(b *testing.B) {
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
 	if !*longTestFlag {
-		b.Skip()
+		bms = []benchmark{
+			{"map size 1000000", 1_000_000},
+		}
 	}
-
 	for _, bm := range bms {
 		b.Run(bm.name, func(b *testing.B) {
 			b.ReportAllocs()
-			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				testB = New(bm.mapElements)
+				m := New(bm.mapElements)
+				for j := Key(0); j < Key(bm.mapElements); j++ {
+					m.Set(j, Value(j))
+				}
 			}
-
-			b.StopTimer()
-			runtime.GC()
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
-			b.ReportMetric(float64(memStats.HeapAlloc)/float64(16*bm.mapElements), "overhead")
-			b.ReportMetric(float64(memStats.HeapAlloc), "heap:bytes")
-
-			// the nil reduces highwater mark -- don't have 2 in mem at once
-			testA = nil
 		})
 	}
 }
 
-// older:
+func BenchmarkFillPresize_Std(b *testing.B) {
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
+	if !*longTestFlag {
+		bms = []benchmark{
+			{"map size 1000000", 1_000_000},
+		}
+	}
+	for _, bm := range bms {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 
-// ---- INSERT ----
-// Roughly 1.89x slower for 1M
-// Roughly 1.639x slower for 1K
+			for i := 0; i < b.N; i++ {
+				m := make(map[int64]int64, bm.mapElements)
+				for j := int64(0); j < int64(bm.mapElements); j++ {
+					m[j] = j
+				}
+			}
+		})
+	}
+}
 
-// FIRST CUT
-
-// BenchmarkMapsInt64KeysInsert-4   	      15	  72443760 ns/op	   10462 B/op	       1 allocs/op
-// BenchmarkMapsInt64KeysInsert-4   	      15	  74837213 ns/op	   10462 B/op	       1 allocs/op
-// 1x capacity:
-// BenchmarkSparsemapInsert-4   	       5	     232332120 ns/op	 4194304 B/op	    3276 allocs/op
-// 2x capacity:
-// BenchmarkSparsemapInsert-4   	       7	     148209329 ns/op	  814080 B/op	     636 allocs/op
-// >2x (?) capacity:
-// BenchmarkSparsemapInsert-4   	       7	     185569914 ns/op	       0 B/op	       0 allocs/op
-
-/*
-INSERT
-
-// insert repeated benchmark
-go test -count=20 -benchmem -run=^$ -bench ^BenchmarkSparse.*Insert1K$ github.com/thpudds/sparsehash > sparse-1K-insert.txt
-
-// insert pprof
-go test -benchtime=20s -benchmem -cpuprofile sparse-profile-1k-insert-20s.out -run=^$ -bench ^BenchmarkSparse.*Insert1K$ github.com/thpudds/sparsehash
-
-benchstat std-really-1M-insert.txt
-name                     time/op
-MapsInt64KeysInsert1M-4  72.4ms ± 3%
-
-benchstat sparse-1M-insert.txt
-name                 time/op
-SparsemapInsert1M-4  137ms ± 4%
-
-
-benchstat std-1K-insert.txt
-name                     time/op
-MapsInt64KeysInsert1K-4  23.0µs ± 4%
-
-
-benchstat sparse-1K-insert.txt
-name                 time/op
-SparsemapInsert1K-4  37.7µs ± 3%
-
-*/
-
-// ---- LOOKUP ----
-// Roughly 1.5x slower for 1K
-// Roughly 2.0x slower for 1M
-
-// BenchmarkMapsInt64KeysLookup-4   	      18	  63500650 ns/op	       0 B/op	       0 allocs/op
-// BenchmarkSparsemapLookup-4   	       8	     133696150 ns/op	       0 B/op	       0 allocs/op
-
-// 1.54 slower for small (1k)
-// was: 1.67x slower for small (1K)
-
-// benchstat std-1K.txt
-// name                   time/op
-// MapsInt64KeysLookup-4  19.9µs ± 4%
-
-// benchstat sparse-1K.txt
-// name               time/op
-// SparsemapLookup-4  33.2µs ± 9%
-
-// benchstat sparse-1K-pos-simpl.txt
-// name               time/op
-// SparsemapLookup-4  30.8µs ± 1%
-
-// 10% improvement for pos-simpl:
-// benchstat sparse-1K.txt sparse-1K-pos-simpl.txt
-// name               old time/op    new time/op    delta
-// SparsemapLookup-4    33.2µs ± 9%    30.8µs ± 1%  -7.27%  (p=0.000 n=17+17)
-
-// ==> 33 nanoseconds
-
-// -----------------------------
-
-// 2x slower for 1M
-
-// benchstat std-1M.txt
-// name                   time/op
-// MapsInt64KeysLookup-4  63.9ms ± 2%
-
-// benchstat sparse-1M.txt
-// name               time/op
-// SparsemapLookup-4  128ms ± 4%
-
-// ==> 128 nanoseconds
-// L2 access is ~7 nanoseconds
-// RAM access is ~100 nanoseconds
-
-// pprof:
-// go test -benchtime=20s -benchmem -run=^$ -cpuprofile sparse-profile-small-20s.out -bench ^BenchmarkSparse.*Lookup$ github.com/thpudds/sparsehash
-
-/*
-
-INSERT pprof
-
-small:
-
-$ go tool pprof sparse-profile-1k-insert-20s.out
-Type: cpu
-Time: Feb 2, 2022 at 3:01pm (EST)
-Duration: 24.84s, Total samples = 12.78s (51.46%)
-Entering interactive mode (type "help" for commands, "o" for options)
-(pprof) top 20
-Showing nodes accounting for 12.56s, 98.28% of 12.78s total
-Dropped 27 nodes (cum <= 0.06s)
-Showing top 20 nodes out of 24
-      flat  flat%   sum%        cum   cum%
-     3.71s 29.03% 29.03%      3.71s 29.03%  aeshashbody
-     2.48s 19.41% 48.44%     12.13s 94.91%  github.com/thpudds/sparsehash.(*Map).Set
-     2.31s 18.08% 66.51%      3.29s 25.74%  github.com/thpudds/sparsehash/internal/sparsetable.(*Table).Get
-	 1.42s 11.11% 77.62%      1.91s 14.95%  github.com/thpudds/sparsehash/internal/sparsetable.(*Table).Set
-     0.89s  6.96% 84.59%      0.89s  6.96%  github.com/thpudds/sparsehash/internal/sparsetable.(*sparsegroup).isAssigned (inline)
-     0.50s  3.91% 88.50%      0.50s  3.91%  github.com/thpudds/sparsehash/internal/sparsetable.(*sparsegroup).posToOffset
-     0.47s  3.68% 92.18%      4.39s 34.35%  github.com/thpudds/sparsehash.hashUint64
-     0.37s  2.90% 95.07%     12.50s 97.81%  github.com/thpudds/sparsehash.BenchmarkSparsemapInsert1K
-     0.21s  1.64% 96.71%      0.21s  1.64%  runtime.memhash
-
-1M: (biggest chunk of time is where we first touch the group.Values slice, i.e., cold)
-
-(pprof) top 15
-Showing nodes accounting for 19.06s, 97.24% of 19.60s total
-Dropped 69 nodes (cum <= 0.10s)
-Showing top 15 nodes out of 25
-      flat  flat%   sum%        cum   cum%
-    11.47s 58.52% 58.52%     14.53s 74.13%  github.com/thpudds/sparsehash/internal/sparsetable.(*Table).Get
-     2.99s 15.26% 73.78%      2.99s 15.26%  github.com/thpudds/sparsehash/internal/sparsetable.(*sparsegroup).isAssigned (inline)
-     1.70s  8.67% 82.45%      1.70s  8.67%  aeshashbody
-     1.34s  6.84% 89.29%     18.78s 95.82%  github.com/thpudds/sparsehash.(*Map).Set
-     0.66s  3.37% 92.65%      0.94s  4.80%  github.com/thpudds/sparsehash/internal/sparsetable.(*Table).Set
-     0.27s  1.38% 94.03%      0.27s  1.38%  github.com/thpudds/sparsehash/internal/sparsetable.(*sparsegroup).posToOffset (partial-inline)
-     0.23s  1.17% 95.20%      0.23s  1.17%  runtime.stdcall1
-
-
-GET pprof
-
-$ go tool pprof sparse-profile-small-20s-simplify-postooffset-2.out
-Type: cpu
-Time: Feb 2, 2022 at 2:31pm (EST)
-Duration: 25.32s, Total samples = 13.24s (52.28%)
-Entering interactive mode (type "help" for commands, "o" for options)
-(pprof) top20
-Showing nodes accounting for 12.96s, 97.89% of 13.24s total
-Dropped 35 nodes (cum <= 0.07s)
-Showing top 20 nodes out of 25
-      flat  flat%   sum%        cum   cum%
-     4.43s 33.46% 33.46%      4.43s 33.46%  aeshashbody
-     3.05s 23.04% 56.50%      4.31s 32.55%  github.com/thpudds/sparsehash/internal/sparsetable.(*Table).Get
-     2.67s 20.17% 76.66%     12.25s 92.52%  github.com/thpudds/sparsehash.(*Map).Get
-     0.87s  6.57% 83.23%      0.87s  6.57%  github.com/thpudds/sparsehash/internal/sparsetable.(*sparsegroup).isAssigned (inline)
-     0.59s  4.46% 87.69%      5.22s 39.43%  github.com/thpudds/sparsehash.hashUint64
-     0.49s  3.70% 91.39%     12.74s 96.22%  github.com/thpudds/sparsehash.BenchmarkSparsemapLookup
-     0.37s  2.79% 94.18%      0.37s  2.79%  github.com/thpudds/sparsehash/internal/sparsetable.(*sparsegroup).posToOffset
-     0.20s  1.51% 95.69%      0.20s  1.51%  runtime.memhash
-     0.17s  1.28% 96.98%      0.17s  1.28%  runtime.stdcall1
-     0.05s  0.38% 97.36%      0.09s  0.68%  runtime/pprof.(*profMap).lookup
-
-
-*/
-
-var testA map[int64]*int64
-var testB *Map
+// TODO: probably change over to sinkKey, sinkValue, and use map[Key]Value as the runtime maps
 var sinkUint uint64
+var sinkInt int64
+var sinkValue Value
 var sinkBool bool
 
-func BenchmarkAdd1M_Int64_Std(b *testing.B) {
-	mapElements := 1_000_000
-
-	m := make(map[uint64]uint64, mapElements)
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		for k := 0; k < mapElements; k++ {
-			m[uint64(k)] = uint64(k)
-		}
-	}
-}
-
-func BenchmarkAdd1M_Int64_Swisstable(b *testing.B) {
-	mapElements := 1_000_000
-
-	m := New(mapElements)
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	// Note this does not report the final mem usage.
-	for i := 0; i < b.N; i++ {
-		for k := 0; k < mapElements; k++ {
-			m.Set(Key(k), Value(k))
-		}
-	}
-}
-func BenchmarkAdd1K_Int64_Std(b *testing.B) {
-	mapElements := 1_000
-
-	m := make(map[uint64]uint64, mapElements)
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		for k := 0; k < mapElements; k++ {
-			m[uint64(k)] = uint64(k)
-		}
-	}
-}
-
-func BenchmarkAdd1K_Int64_Swisstable(b *testing.B) {
-	mapElements := 1_000
-
-	m := New(mapElements)
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	// Note this does not report the final mem usage.
-	for i := 0; i < b.N; i++ {
-		for k := 0; k < mapElements; k++ {
-			m.Set(Key(k), Value(k))
-		}
-	}
-}
-
-func BenchmarkGet1K_Int64_1KStd(b *testing.B) {
-	mapElements := 1_000
-
-	m := make(map[uint64]uint64, mapElements)
-	for k := 0; k < mapElements; k++ {
-		m[uint64(k)] = uint64(k)
-	}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		for k := 0; k < mapElements; k++ {
-			sinkUint, sinkBool = m[uint64(k)]
-		}
-	}
-}
-
-func BenchmarkGet1K_Int64_1KSwisstable(b *testing.B) {
-	mapElements := 1_000
-
-	m := New(mapElements)
-	for k := 0; k < mapElements; k++ {
-		m.Set(Key(k), Value(k))
-	}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		for k := 0; k < mapElements; k++ {
-			v, b := m.Get(Key(k))
-			sinkUint = uint64(v)
-			sinkBool = b
-		}
-	}
-}
-
-// 400K -> 2.2M
-// 100K
-// 3 each
-
-func BenchmarkGet1KWarm_Int64_1MStd(b *testing.B) {
+func BenchmarkGetHitHot_Swiss(b *testing.B) {
 	hotKeyCount := 20
-	lookupLoop := 50
+	lookupEachKey := 50
 
-	var bms []benchmark
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
 	if !*longTestFlag {
 		bms = []benchmark{
-			{"map size 1000", 1_000},
 			{"map size 1000000", 1_000_000},
 		}
-	} else {
-		bms = coarseMapSizes()
-		bms = append(bms, fineMapSizes()...)
 	}
 
 	for _, bm := range bms {
 		b.Run(bm.name, func(b *testing.B) {
-			m := make(map[uint64]uint64, bm.mapElements)
-			for i := 0; i < bm.mapElements; i++ {
-				m[uint64(i)] = uint64(i)
-			}
-
-			var hotKeys []uint64
-			for i := 0; i < hotKeyCount; i++ {
-				hotKeys = append(hotKeys, uint64(rand.Intn(bm.mapElements)))
-				sinkUint, sinkBool = m[uint64(i)]
-			}
-
-			b.ReportAllocs()
-			b.ResetTimer()
-
-			for i := 0; i < b.N; i++ {
-				for j := 0; j < lookupLoop; j++ {
-					for k := range hotKeys {
-						sinkUint, sinkBool = m[uint64(k)]
-					}
-				}
-			}
-		})
-	}
-}
-
-type benchmark struct {
-	name        string
-	mapElements int
-}
-
-func BenchmarkGet1K_Hit_Hot_16byte_Swisstable(b *testing.B) {
-	const (
-		hotKeyCount = 20
-		lookupLoop  = 50
-	)
-
-	var bms []benchmark
-	if !*longTestFlag {
-		bms = []benchmark{
-			{"map size 1000", 1_000},
-			{"map size 1000000", 1_000_000},
-		}
-	} else {
-		bms = coarseMapSizes()
-		bms = append(bms, fineMapSizes()...)
-	}
-
-	for _, bm := range bms {
-		b.Run(bm.name, func(b *testing.B) {
+			// Fill the map under test
 			m := New(bm.mapElements)
-			for i := 0; i < bm.mapElements; i++ {
-				m.Set(Key(i), Value(i))
+			for i := Key(0); i < Key(bm.mapElements); i++ {
+				m.Set(i, Value(i))
 			}
 
-			var hotKeys []uint64
+			// Generate random hot keys repeated N times then shuffled
+			var hotKeys []Key
 			for i := 0; i < hotKeyCount; i++ {
-				hotKeys = append(hotKeys, uint64(rand.Intn(bm.mapElements)))
-				v, b := m.Get(Key(i))
-				sinkUint = uint64(v)
-				sinkBool = b
+				hotKeys = append(hotKeys, Key(rand.Intn(bm.mapElements)))
 			}
+			var gets []Key
+			for i := 0; i < hotKeyCount; i++ {
+				k := hotKeys[i]
+				for j := 0; j < lookupEachKey; j++ {
+					gets = append(gets, k)
+				}
+			}
+			rand.Shuffle(len(gets), func(i, j int) {
+				gets[i], gets[j] = gets[j], gets[i]
+			})
 
 			b.ReportAllocs()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				for j := 0; j < lookupLoop; j++ {
-					for k := range hotKeys {
-						v, b := m.Get(Key(k))
-						sinkUint = uint64(v)
-						sinkBool = b
-					}
+				for _, key := range gets {
+					v, b := m.Get(key)
+					sinkInt = int64(v)
+					sinkBool = b
 				}
 			}
-			b.StopTimer()
-			// TODO: remove stats output
-			b.Logf("stats: gets: %d extra groups: %d tophash false pos: %d",
-				m.gets, m.getExtraGroups, m.getTopHashFalsePositives)
 		})
 	}
 }
 
-func BenchmarkGet1K_Hit_Cold_Swisstable(b *testing.B) {
-	var bms []benchmark
+func BenchmarkGetHitHot_Std(b *testing.B) {
+	hotKeyCount := 20
+	lookupEachKey := 50
+
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
 	if !*longTestFlag {
 		bms = []benchmark{
-			{"map size 1000", 1_000},
-			{"map size 10000", 10_000},
-			{"map size 100000", 100_000},
 			{"map size 1000000", 1_000_000},
 		}
-	} else {
-		bms = coarseMapSizes()
-		bms = append(bms, fineMapSizes()...)
 	}
 
 	for _, bm := range bms {
 		b.Run(bm.name, func(b *testing.B) {
-			minMem := 512.0 * (1 << 20)
+			// Fill the map under test
+			m := make(map[int64]int64, bm.mapElements)
+			for i := 0; i < bm.mapElements; i++ {
+				m[int64(i)] = int64(i)
+			}
+
+			// Generate random hot keys repeated N times then shuffled
+			var hotKeys []int64
+			for i := 0; i < hotKeyCount; i++ {
+				hotKeys = append(hotKeys, int64(rand.Intn(bm.mapElements)))
+			}
+			var gets []int64
+			for i := 0; i < hotKeyCount; i++ {
+				k := hotKeys[i]
+				for j := 0; j < lookupEachKey; j++ {
+					gets = append(gets, k)
+				}
+			}
+			rand.Shuffle(len(gets), func(i, j int) {
+				gets[i], gets[j] = gets[j], gets[i]
+			})
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				for _, key := range gets {
+					sinkInt, sinkBool = m[key]
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkGetMissHot_Swiss(b *testing.B) {
+	hotKeyCount := 20
+	lookupEachKey := 50
+
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
+	if !*longTestFlag {
+		bms = []benchmark{
+			{"map size 1000000", 1_000_000},
+		}
+	}
+
+	for _, bm := range bms {
+		b.Run(bm.name, func(b *testing.B) {
+			// Fill the map under test
+			m := New(bm.mapElements)
+			for i := Key(0); i < Key(bm.mapElements); i++ {
+				m.Set(i, Value(i))
+			}
+
+			// Generate keys that don't exist, repeated N times then shuffled
+			var missKeys []Key
+			for i := 0; i < hotKeyCount; i++ {
+				missKeys = append(missKeys, Key(i+(1<<40)))
+			}
+			var gets []Key
+			for i := 0; i < hotKeyCount; i++ {
+				k := missKeys[i]
+				for j := 0; j < lookupEachKey; j++ {
+					gets = append(gets, k)
+				}
+			}
+			rand.Shuffle(len(gets), func(i, j int) {
+				gets[i], gets[j] = gets[j], gets[i]
+			})
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				for _, key := range gets {
+					v, b := m.Get(key)
+					sinkInt = int64(v)
+					sinkBool = b
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkGetMissHot_Std(b *testing.B) {
+	hotKeyCount := 20
+	lookupEachKey := 50
+
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
+	if !*longTestFlag {
+		bms = []benchmark{
+			{"map size 1000000", 1_000_000},
+		}
+	}
+
+	for _, bm := range bms {
+		b.Run(bm.name, func(b *testing.B) {
+			// Fill the map under test
+			m := make(map[int64]int64, bm.mapElements)
+			for i := 0; i < bm.mapElements; i++ {
+				m[int64(i)] = int64(i)
+			}
+
+			// Generate keys that don't exist, repeated N times then shuffled
+			var missKeys []int64
+			for i := 0; i < hotKeyCount; i++ {
+				missKeys = append(missKeys, int64(i+(1<<40)))
+			}
+			var gets []int64
+			for i := 0; i < hotKeyCount; i++ {
+				k := missKeys[i]
+				for j := 0; j < lookupEachKey; j++ {
+					gets = append(gets, k)
+				}
+			}
+			rand.Shuffle(len(gets), func(i, j int) {
+				gets[i], gets[j] = gets[j], gets[i]
+			})
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				for _, key := range gets {
+					sinkInt, sinkBool = m[key]
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGetAllStartCold_Std creates many maps so that they are
+// cold at the start. It is intended to be run with -benchtime=1x.
+func BenchmarkGetAllStartCold_Std(b *testing.B) {
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
+	if !*longTestFlag {
+		bms = []benchmark{
+			{"map size 1000000", 1_000_000},
+		}
+	}
+
+	for _, bm := range bms {
+		b.Run(bm.name, func(b *testing.B) {
+			minMem := *coldMemTestFlag * (1 << 20)
 
 			// we don't use overhead to keep the count of maps consistent
-			// across different implemenations
+			// across different implementations
+			mapMem := float64(bm.mapElements) * 16
+			mapCnt := int(math.Ceil(minMem / mapMem))
+
+			keys := make([]int64, bm.mapElements)
+			for i := int64(0); i < int64(len(keys)); i++ {
+				keys[i] = i
+			}
+
+			b.Logf("creating %d maps with %.1f MB of data. %d total keys", mapCnt, float64(mapCnt)*mapMem/(1<<20), mapCnt*bm.mapElements)
+			maps := make([]map[int64]int64, mapCnt)
+			for i := 0; i < mapCnt; i++ {
+				m := make(map[int64]int64, bm.mapElements)
+				for j := int64(0); j < int64(bm.mapElements); j++ {
+					m[j] = j
+				}
+				maps[i] = m
+			}
+
+			// Shuffle the keys after we have placed them in the maps.
+			// Otherwise, we could favor early entrants in a given bucket when reading below.
+			rand.Shuffle(len(keys), func(i, j int) {
+				keys[i], keys[j] = keys[j], keys[i]
+			})
+
+			getKeys := func(m map[int64]int64, ratio float64) {
+				count := int(ratio * float64(bm.mapElements))
+				for _, k := range keys {
+					if count == 0 {
+						break
+					}
+					count--
+					sinkInt, sinkBool = m[k]
+				}
+			}
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// We keep the same order of maps and keys in their respective slices
+				// so that any given map or key is more likely to be cold by the time we
+				// cycle back around if b.N is > 1. In practice, b.N seems to usually be 1.
+				for _, m := range maps {
+					getKeys(m, 1.0)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGetAllStartCold_Swiss creates many maps so that they are
+// cold at the start. It is intended to be run with -benchtime=1x.
+func BenchmarkGetAllStartCold_Swiss(b *testing.B) {
+	bms := almostGrowPointMapSizes([]int{
+		1 << 10,
+		1 << 20,
+		1 << 23,
+	})
+	if !*longTestFlag {
+		bms = []benchmark{
+			{"map size 1000000", 1_000_000},
+		}
+	}
+
+	for _, bm := range bms {
+		b.Run(bm.name, func(b *testing.B) {
+			minMem := *coldMemTestFlag * (1 << 20)
+
+			// we don't use overhead to keep the count of maps consistent
+			// across different implementations
 			mapMem := float64(bm.mapElements) * 16
 			mapCnt := int(math.Ceil(minMem / mapMem))
 
@@ -728,11 +1122,8 @@ func BenchmarkGet1K_Hit_Cold_Swisstable(b *testing.B) {
 			for i := 0; i < len(keys); i++ {
 				keys[i] = Key(i)
 			}
-			rand.Shuffle(len(keys), func(i, j int) {
-				keys[i], keys[j] = keys[j], keys[i]
-			})
 
-			b.Logf("creating %d maps with %.1f KB of data. %d total keys", mapCnt, float64(mapCnt)*mapMem/1024, mapCnt*bm.mapElements)
+			b.Logf("creating %d maps with %.1f MB of data. %d total keys", mapCnt, float64(mapCnt)*mapMem/(1<<20), mapCnt*bm.mapElements)
 			maps := make([]*Map, mapCnt)
 			for i := 0; i < mapCnt; i++ {
 				m := New(bm.mapElements)
@@ -741,48 +1132,100 @@ func BenchmarkGet1K_Hit_Cold_Swisstable(b *testing.B) {
 				}
 				maps[i] = m
 			}
-			rand.Shuffle(len(maps), func(i, j int) {
-				maps[i], maps[j] = maps[j], maps[i]
+
+			// Shuffle the keys after we have placed them in the maps.
+			// Otherwise, we could favor early entrants in a given bucket when reading below.
+			rand.Shuffle(len(keys), func(i, j int) {
+				keys[i], keys[j] = keys[j], keys[i]
 			})
 
-			b.ReportAllocs()
+			getKeys := func(m *Map, ratio float64) {
+				count := int(ratio * float64(bm.mapElements))
+				for _, k := range keys {
+					if count == 0 {
+						break
+					}
+					count--
+					v, b := m.Get(Key(k))
+					sinkValue = v
+					sinkBool = b
+				}
+			}
+
 			b.ResetTimer()
 
-			start := time.Now()
 			for i := 0; i < b.N; i++ {
-				// Exhaustively look up all keys
-				for _, k := range keys {
-					for _, m := range maps {
-						// force no op:
-						// _ = k
-						// _ = m
-
-						// force key reuse:
-						// k = 0
-
-						// do real work
-						v, b := m.Get(Key(k))
-						sinkUint = uint64(v)
-						sinkBool = b
-					}
+				// We keep the same order of maps and keys in their respective slices
+				// so that any given map or key is more likely to be cold by the time we
+				// cycle back around if b.N is > 1. In practice, b.N seems to usually be 1.
+				for _, m := range maps {
+					getKeys(m, 1.0)
 				}
-				// Done with this i for b.N.
-				// Get new keys, and shuffle our maps.
-				// TODO: Could sufficient to just pick random starting position for the maps,
-				// but shuffle might be fast enough - shuffle 1M takes ~35ms.
-				// b.StopTimer()
-				// // TODO: no keys
-				// // keys = randomKeys(coldKeyCount, bm.mapElements-coldKeyCount)
-				// // TODO: maybe not needed to shuffle maps again?
-				// rand.Shuffle(len(maps), func(i, j int) {
-				// 	maps[i], maps[j] = maps[j], maps[i]
-				// })
-				// b.StartTimer()
-				end := time.Since(start)
-				b.ReportMetric(float64(end.Nanoseconds())/(float64(b.N)*float64(len(keys)*len(maps))), "ns/get")
 			}
 		})
 	}
+}
+
+//go:noinline
+func iterStd(m map[int64]int64) int64 {
+	var ret int64
+	for _, a := range m {
+		ret += a
+	}
+	return ret
+}
+
+func BenchmarkRange_Std(b *testing.B) {
+	// From https://github.com/golang/go/issues/51410, but with int64 rather than strings.
+	// That should mean the hashing impact is less here.
+	minSize := 51 // was 50
+	maxSize := 58 // was 60
+	for size := minSize; size < maxSize; size++ {
+		b.Run(fmt.Sprintf("map_size_%d", size), func(b *testing.B) {
+			m := make(map[int64]int64)
+			for i := 0; i < size; i++ {
+				m[int64(i)] = int64(i)
+			}
+			var x int64
+			for i := 0; i < b.N; i++ {
+				x += iterStd(m)
+			}
+		})
+	}
+}
+
+//go:noinline
+func iterSwiss(m *Map) int64 {
+	var ret int64
+	m.Range(func(key Key, value Value) bool {
+		ret += int64(value)
+		return true
+	})
+	return ret
+}
+
+func BenchmarkRange_Swiss(b *testing.B) {
+	// From https://github.com/golang/go/issues/51410, but with int64 rather than strings.
+	// That should mean the hashing impact is less here.
+	minSize := 51 // was 50
+	maxSize := 58 // was 60
+	for size := minSize; size < maxSize; size++ {
+		b.Run(fmt.Sprintf("map_size_%d", size), func(b *testing.B) {
+			m := New(10)
+			for i := 0; i < size; i++ {
+				m.Set(Key(i), Value(i))
+			}
+			var x int64
+			for i := 0; i < b.N; i++ {
+				x += iterSwiss(m)
+			}
+		})
+	}
+}
+
+type benchmark struct {
+	name        string
+	mapElements int
 }
 
 // coarseMapSizes returns a []benchmark with large steps from 1K to 100M elements
@@ -802,6 +1245,23 @@ func coarseMapSizes() []benchmark {
 			break
 		}
 		mapSize = int(float64(mapSize) * mapSizeCoarseFactor)
+	}
+	return bms
+}
+
+func almostGrowPointMapSizes(pow2s []int) []benchmark {
+	var bms []benchmark
+	for _, size := range pow2s {
+		if size&(size-1) != 0 || size == 0 {
+			panic(fmt.Sprintf("bad test setup, size %d is not power of 2", size))
+		}
+		growPoint := (size * 13 / 2 / 8) + 1 // TODO: centralize
+
+		s1 := int(0.8 * float64(growPoint))
+		s2 := int(1.2 * float64(growPoint))
+
+		bms = append(bms, benchmark{name: fmt.Sprintf("map size %d", s1), mapElements: s1})
+		bms = append(bms, benchmark{name: fmt.Sprintf("map size %d", s2), mapElements: s2})
 	}
 	return bms
 }
@@ -872,4 +1332,135 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// zeroHash is a terrible hash function that is reproducible
+// and can help trigger corner cases.
+func zeroHash(k Key, seed uintptr) uint64 {
+	// could do something like: return uint64(k << m.current.h2Shift)
+	return 0
+}
+
+// identityHash is another terrible hash function, but not as bad
+// as zeroHash.
+func identityHash(k Key, seed uintptr) uint64 {
+	return uint64(k)
+}
+
+func dumpFixedTables(m *Map) {
+	tables := []struct {
+		name string
+		t    *fixedTable
+	}{
+		{"current", &m.current},
+		{"old", m.old},
+	}
+	for _, t := range tables {
+		fmt.Println("\n===", t.name, "===")
+		if t.t == nil {
+			fmt.Println("table is nil")
+			return
+		}
+		for i := range t.t.slots {
+			if i%16 == 0 {
+				fmt.Println()
+				fmt.Println(t.name, "group", i/16)
+				fmt.Println("-----")
+			}
+			fmt.Printf("%08b %v\n", t.t.control[i], t.t.slots[i])
+		}
+	}
+}
+
+// list returns a slice of of keys based on start (inclusive), end (exclusive), and stride
+func list(start, end, stride Key) []Key {
+	var res []Key
+	for i := start; i < end; i += stride {
+		res = append(res, i)
+	}
+	return res
+}
+
+// keysAndValues collects keys and values from a Map into a runtime map
+// for use in testing and fuzzing.
+// It panics if the same key is observed twice while iterating over the keys.
+func keysAndValues(m *Map) map[Key]Value {
+	res := make(map[Key]Value)
+	m.Range(func(key Key, value Value) bool {
+		// validate we don't see the same key twice
+		_, ok := res[key]
+		if ok {
+			panic(fmt.Sprintf("Map.Range() key %v seen before", key))
+		}
+		res[key] = value
+		return true
+	})
+	return res
+}
+
+// keySet is a simple set to aid with valiation
+type keySet struct {
+	m map[Key]struct{}
+}
+
+func newKeySet(elems []Key) *keySet {
+	s := &keySet{}
+	s.m = make(map[Key]struct{})
+	for _, k := range elems {
+		s.add(k)
+	}
+	return s
+}
+
+func (s *keySet) add(k Key) {
+	s.m[k] = struct{}{}
+}
+
+func (s *keySet) remove(k Key) {
+	delete(s.m, k)
+}
+
+func (s *keySet) contains(k Key) bool {
+	_, ok := s.m[k]
+	return ok
+}
+
+func (s *keySet) len() int {
+	return len(s.m)
+}
+
+func (s *keySet) elems() []Key {
+	var keys []Key
+	for key := range s.m {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i] < keys[j]
+	})
+	return keys
+}
+
+func Test_fixedTable_reconstructHash(t *testing.T) {
+	tests := []struct {
+		capacity int // must be power of 2
+	}{
+		{16}, {1 << 6}, {1 << 17},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("capacity %d", tt.capacity), func(t *testing.T) {
+			table := newFixedTable(tt.capacity)
+			for i := 0; i < 100; i++ {
+				hash := hashUint64(Key(0), uintptr(i))
+				group := hash & table.groupMask
+				h2 := table.h2(hash)
+
+				usefulPortionMask := (1 << (table.h2Shift + 7)) - 1
+				usefulHash := hash & uint64(usefulPortionMask)
+
+				if got := table.reconstructHash(h2, group); got != usefulHash {
+					t.Fatalf("fixedTable.reconstructHash() = 0x%X, want 0x%X", got, usefulHash)
+				}
+			}
+		})
+	}
 }
