@@ -1,4 +1,4 @@
-module github.com/thepudds/swisstable-wip
+module github.com/thepudds/swisstable
 
 go 1.17
 
