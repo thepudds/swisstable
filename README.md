@@ -45,3 +45,21 @@ GetAllStartCold/8178894-4  4.77s ± 1%     6.82s ± 3%  +43.15%  (p=0.000 n=9+10
 [Geo mean]                                            -15.20%
 ```
 
+There is an overview of the approach [here](https://github.com/golang/go/issues/54766#issuecomment-1270385441), and some comments on the current performance [here](https://github.com/golang/go/issues/54766#issuecomment-1270533454).
+
+## Iteration
+
+The current iterator implementation (which we will call "alternative 1") has the following high-level approach:
+
+* Evacuation status is maintained during growth in a separate growth status slice. (This growth status slice uses memory, but it is not per element but rather per group info, and it uses less than the memory overhead of the overflow buckets used by the current runtime map, even for small keys).
+* Iterators hold on to references to the current table and an immutable-during-growth old table. (The runtime iterators also hold on to references to tables, but the runtime's old buckets are not immutable).
+* Iterators walk both the old and current tables, with de-duplication to avoid emitting the same key twice and checking the live tables when needed to emit the golden data. It has some logic to avoid some hashing while doing this, and I think it does less overall hashing during mid-move iteration than the runtime map iterator (but need to confirm the hashing frequency vs. the runtime a bit more).
+
+### Some iteration alternatives:
+
+* Alternative 2: similar to Alternative 1, but using atomics to do growth work during iteration and Get operations, which would have common cases of atomic loads and take advantage of the old table being immutable during growth. Set and Delete would not use atomics.
+
+* Alternative 3: "iteration is moving, and always move chains". This only loops over the snapshot of the current table (and does not loop over the snapshot of hold), but would look back to old if a group is not evacuated. The basic case is emitting all elements from their natural group in the current snapshot. This uses atomics to do grow work during iteration and Get. Iteration would always move any probe chains found in old, which simplifies & improves the performance  of some cases. 
+
+* Alternative 4: similar to Alternative 2, but without using atomics and without doing grow work during iteration and Get. The basic case is still emitting all elements from their natural group in the current snapshot, but instead of moving chains, it instead follows probe chains forward and hashes to determine the natural group.
+
