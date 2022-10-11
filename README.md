@@ -57,9 +57,12 @@ The current iterator implementation (which we will call "alternative 1") has the
 
 ### Some iteration alternatives:
 
-* Alternative 2: similar to Alternative 1, but using atomics to do growth work during iteration and Get operations, which would have common cases of atomic loads and take advantage of the old table being immutable during growth. Set and Delete would not use atomics.
+* **Alternative 2**: similar to Alternative 1, but uses atomics to do growth work during iteration and Get operations, which have common cases of atomic loads and takes advantage of the old table being immutable during growth. Set and Delete do not use atomics.
 
-* Alternative 3: "iteration is moving, and always move chains". This only loops over the snapshot of the current table (and does not loop over the snapshot of hold), but would look back to old if a group is not evacuated. The basic case is emitting all elements from their natural group in the current snapshot. This uses atomics to do grow work during iteration and Get. Iteration would always move any probe chains found in old, which simplifies & improves the performance  of some cases. 
+* **Alternative 3**: "iteration is moving". This loops over the snapshot of the current table (and does not loop over the snapshot of old), but evacuates any non-evacuated group encountered. This uses atomics to do growth work during iteration and Get.
 
-* Alternative 4: similar to Alternative 2, but without using atomics and without doing grow work during iteration and Get. The basic case is still emitting all elements from their natural group in the current snapshot, but instead of moving chains, it instead follows probe chains forward and hashes to determine the natural group.
+* **Alternative 4**: "iteration moves any chains". This also loops over the snapshot of the current table (and does not loop over the snapshot of old), but looks back to old if a group is not evacuated. The basic case is emitting all elements from their natural group in the current snapshot. This uses atomics to do growth work during iteration and Get. Iteration always moves any probe chains found in old, which simplifies & improves the performance of some cases.
 
+* **Alternative 5**: a variation on Alternative 4, but without using atomics and without doing growth work during iteration and Get. The basic case is emitting all elements from their natural group in the current snapshot, but instead of moving chains, it instead follows probe chains forward and hashes to determine the natural group when needed.
+
+In all alternatives listed, if a new grow has begun since the start of the iteration operation, the live tables are consulted to ensure live golden data is emitted and to handle keys that have been deleted.
